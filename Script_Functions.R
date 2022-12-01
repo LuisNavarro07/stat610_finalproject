@@ -35,13 +35,24 @@ while (i <= samples){
   i = i + 1
 }
 ### Average Treatment Effect 
-ate <- coef(baseline_model)
+ate <- coef(baseline_model) %>% as.double()
 ### Standard Error: standard deviation from the empirical distribution 
-std_error <- sd(empirical_distribution)
+std_error <- sd(empirical_distribution) %>% as.double()
 ### P-value: proportion of times the placebo treatment effect is larger than the estimated treatment effect 
-pval <- sum(empirical_distribution >= ate)/samples
+pval <- sum(empirical_distribution >= ate)/samples %>% as.double()
 model_results <- data.frame(coefficient = ate, std_error = std_error, pval = pval)
-return(model_results)
+### Do a graph showing the hypothesis graphically 
+empirical_distribution <- empirical_distribution %>% as.data.frame() %>% mutate(ATE = ate)
+### Density Plot of the Empirical Distribution 
+density_plot <- ggplot(empirical_distribution, aes(x = V1)) + 
+  geom_density(alpha=0.25) + 
+  geom_vline(aes(xintercept=mean(ATE)), color = "red", linetype = "dashed") +
+  theme_bw() + geom_density(color="darkblue") +
+  labs(title = "Placebo Distribution of the Average Treatment Effect", y="Density", x = "Parameter Estimate") + 
+  scale_color_manual(name = "Estimate")
+print(density_plot)
+ouput <- list(model_results, density_plot)
+return(ouput)
 }
 
 ### Function 2: Estimate the Difference-in-Difference Model 
@@ -93,86 +104,107 @@ random_treatment <- function(unit_var,data){
 
 ### Function 4: Estimate the Propensity Score Model   
 ################################################################################
-psm_weights <- function(outcome,predictors,id_var,data) {
+psm_weights <- function(outcome,predictors,unit_var,data) {
 ### Get the model with highest accuracy 
-model <- model_selection(outcome,predictors,id_var,data)
+model <- model_selection(outcome, predictors, unit_var, data)
+### Optimal set of predictor variables 
+predictor_star <- model[[1]]
+### Build the data set
+reg_data <- data_build(outcome, predictors, unit_var, data)
 ### Get the Data set with the chosen variables 
-data_build_psm <- subset(data_build(outcome, predictors, id_var, data), 
-                        select = c(id_var, "outcome", model[[1]]))
-### Propensity Score Model
+data_build_psm <- subset(reg_data, 
+                         select = c("outcome", unit_var, predictor_star))
+### Propensity Score Model Formual
 reg_form <- as.formula(paste("outcome",
-                             paste(model[[1]], collapse = " + "), 
+                             paste(predictor_star, collapse = " + "), 
                              sep = " ~ "))
+### Estimate the Propensity Score Model
 psm_model <- glm(reg_form, 
                  data = data_build_psm, 
                  family = binomial(link = "logit"))
 # Generate propensity scores and IPWs
 psm_weights <- data_build_psm %>% mutate(propensity = psm_model$fitted.values) %>% 
                         mutate(ipw = ifelse(outcome == 1, 1/propensity, 1/(1-propensity)))
+### Compute the Prediction Error of the Model 
+data_results <- data_build_psm %>% mutate(predicted = psm_model$fitted.values) %>% 
+  mutate(outcome = as.double(outcome)) %>% 
+  mutate(sq_error = (outcome - predicted)^2) 
+
+### Accuracy Metric: Root Mean Squared Prediction Error 
+rmspe <- data_results$sq_error %>% mean() %>% sqrt()
 ### Return Data Frame with Fips and IPW weights 
-psm_results <- list(model, psm_weights, psm_model)
+psm_results <- list(model, psm_weights, rmspe)
 return(psm_results)
 }
 
 ################################################################################
 ### Function 5: Model Selection for Propensity Score Matching  
 ################################################################################
-model_selection <- function(outcome,predictors,id_var,data){
+model_selection <- function(outcome,predictors,unit_var,data){
 ### Build data set with organized variables. This data set should only include the chosen predictors
 ### the predictors squared, interactions across predictors, and the outcome 
-train_data <- data_build(outcome,predictors,id_var,data)
+reg_data <- data_build(outcome,predictors,unit_var,data)
 ### Initial Set of Predictors
-predictors_i <- colnames(train_data)[which(colnames(train_data) != "outcome")] 
-pred_no <- length(predictors_i) - 1
+predictors_i <- colnames(reg_data)[-which(colnames(reg_data) == c("outcome") | colnames(reg_data) == c(unit_var))] 
+pred_no <- length(predictors_i) 
 predictor_star <- NULL
-kappa_master  <- matrix(data = NA, nrow = pred_no, ncol = 3)
-models_master <- list()
+rmspe_master  <- matrix(data = NA, nrow = pred_no, ncol = 2)
 ### Counters 
-delta_kappa = 0.00001
-kappa_old = 0 
+rmspe_old = 100 
 j = 1
-while(delta_kappa > 0) {
-models <- list()
-kappa <- matrix(data = NA, nrow = pred_no, ncol = 3)
+### The Loop will run until we ran out of possible predictor variables 
+### This is an forward stepwise selection algorithm. It begins with a simple univariate regression
+### and iteratively augments the model by choosing the variable that improves more the RMSPE. 
+### If there is no improvement, then break the loop and return the model. 
+while(pred_no > 0) {
+### Empty matrix store RMSPEs 
+rmspe <- matrix(data = NA, nrow = pred_no, ncol = 3)
 ### Find the variable with highest stand alone prediction accuracy
 for(i in 1:pred_no) {
 ### Model Definition 
-data_subset <- subset(train_data, select = c("outcome",
+data_subset <- subset(reg_data, select = c("outcome",
                                              predictor_star,
                                              predictors_i[i]))
-### Estimate the Logit Models Using Cross Validation
-model_cv <-  train(outcome ~ . , data = data_subset, 
-                          trControl = cv_options, 
-                          method = "glm", 
-                          family = binomial(link = "logit"))
-### Store the Results 
-kappa[i,1] <- i
+### Try a simpler version of this. I don't need to do Cross Validation. 
+### I just to choose the variable with more predictive power. 
+### Estimate the logit model 
+psm_model <- glm(outcome ~ ., data = data_subset, family = binomial(link = "logit"))
+### Store Predicted Values and compute the Squared Prediction Error 
+data_results <- data_subset %>% mutate(predicted = psm_model$fitted.values) %>% 
+                               mutate(outcome = as.double(outcome)) %>% 
+                               mutate(sq_error = (outcome - predicted)^2) 
+              
+### Accuracy Metric: Root Mean Squared Prediction Error 
+rmspe_new <- data_results$sq_error %>% mean() %>% sqrt()
+### Store the Results of the RMSPE for each estimated model 
+rmspe[i,1] <- i
 ### Store the Accuracy of the model. 
-kappa[i,2] <- model_cv$results$Kappa
-### Compute the accuracy improvement relative to the last iteration
-kappa[i,3] <- model_cv$results$Kappa - kappa_old
-models[[i]] <- model_cv
+rmspe[i,2] <- rmspe_new
+### Compute the Accuracy Improvement relative to the previous lap of the loop 
+rmspe[i,3] <- rmspe_old - rmspe_new
 }
-### Update the variables for the other lap of the loop
-kappa_master[j,1] <- j
-kappa_master[j,2] <- max(kappa[,2])
-kappa_master[j,3] <- max(kappa[,3])
-models_master[[j]] <- models[[which(kappa[,2] == max(kappa[,2]))]]
+
+### Store Outer Loop Results
+rmspe_master[j,1] <- j
+rmspe_master[j,2] <- min(rmspe[,2])
+### Choose the Model with highest accuracy improvement
+model_index <- rmspe[which(rmspe[,3] == max(rmspe[,3])),1]
 ### Choose the predictor with highest accuracy
-predictor_star <- c(predictor_star, 
-                    predictors_i[kappa[which(kappa[,2] == max(kappa[,2])),1]])
-### New Predictor Vector 
-predictors_i <- predictors_i[-kappa[which(kappa[,2] == max(kappa[,2])),1]]
-pred_no <- length(predictors_i) - 1
-### Accuracy Improvement
-kappa_old <- max(kappa[,2])
-delta_kappa <- max(kappa[,3])
+predictor_star <- c(predictor_star, predictors_i[model_index])
+### Update the Number of Remaining Predictors 
+predictors_i <- predictors_i[-model_index]
+pred_no <- length(predictors_i)
+### Break if adding a variable did not improved prediction accuracy 
+delta_rmspe <- rmspe_old -  min(rmspe[,2])
+if(delta_rmspe <= 0){
+  break 
+}
+### Define rmspe old for the new loop 
+rmspe_old <- min(rmspe[,2])
 ### Add one to the counter 
 j = j + 1
 }
-### Remove the last predictor (i.e. the one that derived in decreasing the accuracy)
-predictor_star <- predictor_star[-length(predictor_star)]
-results <- list(predictor_star,kappa_master,models_master)
+results <- list(predictor_star,rmspe_master)
 return(results)
 }
 
@@ -181,17 +213,18 @@ return(results)
 
 ### Function 6: Build Data set To Estimate Iteratively the Propensity Score Model 
 ################################################################################
-data_build <- function(outcome,predictors,id_var,data){
+data_build <- function(outcome,predictors,unit_var,data){
   ### Partition the data set in order to do the cross validation 
   full_data <- data %>% na.omit()
   ### Rename outcome
   names(full_data)[which(colnames(full_data) == outcome)] <- "outcome"
+  #names(full_data)[which(colnames(full_data) == unit_var)] <- "unit_var"
   full_data$outcome <- as.factor(full_data$outcome)
   ### Do the partition between training and testing data
-  partition_dataset <- createDataPartition(y = full_data$outcome, p = 0.5 , list = FALSE, times = 1)
-  training <- full_data[partition_dataset,]
-  ### id_var
-  id_var <- subset(full_data, select = id_var)
+  #partition_dataset <- createDataPartition(y = full_data$outcome, p = 0.5 , list = FALSE, times = 1)
+  #training <- full_data[partition_dataset,]
+  ### unit_var
+  unit_var <- subset(full_data, select = unit_var)
   ### Outcome has the name of the outcome variable 
   y <- subset(full_data, select = outcome)
   ### Predictors is a vector with the names of all the variables that will be used as predictors 
@@ -199,6 +232,9 @@ data_build <- function(outcome,predictors,id_var,data){
   #### Squared Predictors 
   x2 <- x^2
   colnames(x2) <- paste0(colnames(x),'.sq')
+  ### Predictors in Inversge Hyperbolic Sin Function  
+  xasinh <- asinh(x)
+  colnames(xasinh) <- paste0(colnames(x),'asinh')
   ### Interaction Terms and Intercept  
   interactions <- model.matrix( ~ .^2, data = x)
   inter_var <- interactions[,-which(colnames(interactions) == "(Intercept)")] %>% as.data.frame()
@@ -207,7 +243,7 @@ data_build <- function(outcome,predictors,id_var,data){
     names(inter_var) <- predictors
   }
   ### Return Dataframe with ordered variables 
-  regdata <- data.frame(id_var, y, inter_var, x2)
+  regdata <- data.frame(unit_var, y, inter_var, x2, xasinh)
   return(regdata)
 }
 ################################################################################

@@ -10,14 +10,7 @@
 ################################################################################
 ### Clean and load libraries 
 rm(list = ls()) 
-library(rmarkdown)
-library(knitr)
-library(formatR)
-knitr::opts_chunk$set(echo = TRUE)
-library(kableExtra)
 library(dplyr)
-library(jtools)
-library(fixest)
 library(broom)
 library(readr)
 library(tidyverse)
@@ -38,8 +31,9 @@ source(file_functions)
 ################################################################################
 #### Parameters of the Simulation 
 treatment_year = 2015 
-ate_beta = 2 
-cutoff_treatment_assignment <- rnorm(1, mean = 0.5, sd = 0.1)
+ate_beta = 10 
+cutoff_treatment_assignment <- rnorm(1, mean = 0.4, sd = 0.1)
+sample_no <- 1000
 ### Variables to use in the simulation
 covariates <- c("fips", "less_hs","hsd","some_college","college",
                 "logpop","unemployment_rate","female",
@@ -64,19 +58,18 @@ data_psm <- mutate(data_psm, female = popest_fem/popestimate,
                              taxes_pc = 1000*total_taxes/popestimate,
                              exp_pc = 1000*total_expenditure/popestimate,
                              currexp = total_current_expend/total_expenditure,
-                             logpop = log(popestimate/1000),
+                             popestimate = popestimate/1000,
                              unemployment_rate = unemployment_rate/100,
                              ### Non Random Treatment Assignment -- Complex Non-Linear Data Generating Process
                              ### Data Generating Process: function of college, female, unemployment_rate, logpop, age513, age4564, taxes_pc, currexp
-                             treat_formula = sqrt(sin(unemployment_rate + female + age4564)) + 
-                                             sqrt(taxes_pc/exp_pc) + cos(currexp)^2 + 
-                                             rnorm(nfips, mean = college, sd = college/2) + 
-                                             sqrt(rnorm(nfips, mean = abs(logpop), sd = abs(logpop)/4)),
+                             treat_formula = unemployment_rate*female + sqrt(age4564) + 
+                                             sqrt(taxes_pc/exp_pc) + currexp^2 + 
+                                             log(1 + college) + log(popestimate) + 
+                                             rnorm(nfips, mean = 0, sd = 1),
                              treat_aux = percent_rank(treat_formula),
                              ### Deterministic Treatment
-                             treat_det = case_when(treat_aux <= cutoff_treatment_assignment/2 ~ 0,
-                                                   treat_aux > cutoff_treatment_assignment/2 & treat_aux <= 1.5*cutoff_treatment_assignment ~ 1,
-                                                   treat_aux > 1.5*cutoff_treatment_assignment ~ 0),)
+                             treat_det = case_when(treat_aux <= cutoff_treatment_assignment ~ 0,
+                                                   treat_aux > cutoff_treatment_assignment ~ 1),)
 
 ### Balance between treatment and control 
 data_psm$treat_det %>% table()
@@ -113,7 +106,6 @@ data_did <- mutate(data_did,  logproptax = log(1+property_tax),
 
 ################################################################################
 ### Simulation Study: Adding Predictors  
-
 ### Estimate the Un-weighted Difference in Difference Model
 unweighted_model <- did_model(outcome = "fake_outcome", 
                               treat_var = "treat_det", treat_period = 2015,
@@ -121,14 +113,15 @@ unweighted_model <- did_model(outcome = "fake_outcome",
                               weights = NULL, data = data_did)
 ################################################################################
 ### Simulation Study: how the model performs when I add one variable to the set of predictors 
-psm_dgp <- c("college","logpop","female","taxes_pc", "unemployment_rate","age513","currexp")
+psm_dgp <- c("college","popestimate","female","taxes_pc", "exp_pc" ,"unemployment_rate","age4564","currexp")
 simulation_results <- list()
 ### Do the Simulation 
 for(k in 1:length(psm_dgp)) {
+###########################
 ### Compute the IPW using the Cross Validation Algorithm
 ipw <- psm_weights(outcome = "treat_det", 
                    predictors = psm_dgp[1:k],
-                   id_var = "fips", 
+                   unit_var = "fips", 
                    data = data_psm)
 ### IPW Weights 
 ipw_weights <- subset(ipw[[2]], select = c("fips", "propensity", "ipw"))
@@ -141,59 +134,51 @@ data_did_model <- merge(data_did, ipw_weights, by = "fips")
 did_estimation <- did_randomization(outcome = "fake_outcome", 
               treat_var = "treat_det", treat_period = 2015,
               time_var = "year", unit_var = "fips",
-              weights = "ipw", data = data_did_model, samples = 1000)
+              weights = "ipw", data = data_did_model, samples = sample_no)
 
 simulation_results[[k]] <- list(ipw, did_estimation)
 }
 ##########################################################3
 
-
-### Show the Results of the Simulation
-ate <- matrix(data = NA, nrow = length(psm_dgp), ncol = 3)
+## Show the Results of the Simulation
+ate <- matrix(data = NA, ncol = length(psm_dgp), nrow = 3)
 for(k in 1:length(psm_dgp)) {
-ate[k,1] <- simulation_results[[k]][[2]][1,1]
-ate[k,2] <- simulation_results[[k]][[2]][1,2]
-ate[k,3] <- k
+ate[1,k] <- simulation_results[[k]][[2]][[1]][1,1]
+ate[2,k] <- simulation_results[[k]][[2]][[1]][1,2]
+
+### Which one is the best model? Retrieve the RMSPE from each one 
+ate[3,k] <- simulation_results[[k]][[1]][[3]] 
 }
 
-unweighted <- unweighted_model$coefficients[[1]]
-
-### Result from the Unweighted Regression 
-unweighted
+### Diagnostics of the Simulation 
 ### Results from the Simulation
-ate
+t(ate) %>% print()
 
-ate_comp <- ate %>% as.data.frame() %>% mutate( ,unweighted = unweighted,  
-                                                 real_ate = ate_beta)
+### Which one is the best model? 
+final_comp <- matrix(data = NA, ncol = 2, nrow = 2, 
+                     dimnames = list(c("ATE","SE"), c("Unweighted","IPW")))
+final_comp[1,1] <- unweighted_model$coefficients[[1]]
+final_comp[2,1] <- unweighted_model$se[[1]]
+final_comp[1,2] <- ate[1,ate[3,] == min(ate[3,])] 
+final_comp[2,2] <- ate[2,ate[3,] == min(ate[3,])] 
+final_comp %>% print()
 
-sim_results_plot <- ggplot(ate_comp, aes(x=V3)) +
-  geom_line(aes(y = V1), color = "black") +
-  geom_line(aes(y = unweighted), color = "red") +
-  geom_line(aes(y = real_ate), color = "blue") +
-  theme_void() +
-  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
-        axis.text.x = element_text(size=10, angle=0), 
-        axis.text.y = element_text(size=10, angle=0)) + 
-  labs(title = "Simulation Results", y="Average Treatment Effect", x = "Number of Predictors")
-print(sim_results_plot)
-
-
-
-#### Compare the Results 
-matrix_coef <- matrix(nrow = 3, ncol = length(psm_dgp) + 1, dimnames = list(c("ATE","SE","pval"), 
-                                                                            c("Unweighted",seq(1:7))))
-
-matrix_coef[1,1] <- unweighted_model$coeftable[1] %>% as.double()
-matrix_coef[2,1] <- unweighted_model$coeftable[2] %>% as.double()
-matrix_coef[3,1] <- unweighted_model$coeftable[4] %>% as.double()
+#### Convergence of the Stepwise Regression 
+combinations <- data_build(outcome = "treat_det", 
+                           predictors = psm_dgp, 
+                           unit_var = "fips", 
+                           data = data_psm) %>% length() - 2
+### All RMSPE results 
+### k - model_selection (1) - rmspe_master (2)
+rmspe_all <- list()
 
 for(k in 1:length(psm_dgp)) {
-## Weighted Regression: beta, se, pval
-  matrix_coef[1,k + 1] <- simulation_results[[k]][[2]][1]  %>% as.double()
-  matrix_coef[2,k + 1] <- simulation_results[[k]][[2]][2]  %>% as.double()
-  matrix_coef[3,k + 1] <- simulation_results[[k]][[2]][3]  %>% as.double()
-} 
-
-matrix_coef %>% print()
-
-### As the number of predictors increase, the accuracy of the estimate increases as well. 
+rmspe_results <- simulation_results[[k]][[1]][[1]][[2]] %>% as.data.frame() %>% na.omit()
+### Graph the Convergence 
+convergence_plot <- ggplot(rmspe_results, aes(x = V1, y = V2)) + 
+  theme_bw() + geom_line(color="darkblue") +
+  labs(title = "RMSPE Convergence", y="RMSPE", x = "Number of Predictors") + 
+  scale_color_manual(name = "Estimate")
+print(convergence_plot)
+rmspe_all[[k]] <- convergence_plot
+}
