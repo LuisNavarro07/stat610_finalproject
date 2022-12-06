@@ -18,22 +18,23 @@ library(ggplot2)
 library(lattice)
 library(caret)
 library(leaps)
+library(fixest)
 ################################################################################
 ### Set the environment
 directory <- "C:/Users/luise/OneDrive - Indiana University/Statistical Computing/Final_Project"
 file_psm <- paste(directory, "/Data/county_data_project_psm.csv", sep = "")
 file_did <- paste(directory, "/Data/county_data_project_did.csv", sep = "")
 file_functions <- paste(directory, "/Code/Script_Functions.R", sep = "")
-set.seed(1234)
+set.seed(1)
 ### Load the functions 
 source(file_functions)
 
 ################################################################################
 #### Parameters of the Simulation 
 treatment_year = 2015 
-ate_beta = 10 
-cutoff_treatment_assignment <- rnorm(1, mean = 0.4, sd = 0.1)
-sample_no <- 1000
+ate_beta = 7 
+cutoff_treatment_assignment <- rnorm(1, mean = 0.4, sd = 0.15)
+sample_no <- 100
 ### Variables to use in the simulation
 covariates <- c("fips", "less_hs","hsd","some_college","college",
                 "logpop","unemployment_rate","female",

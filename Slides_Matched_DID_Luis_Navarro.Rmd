@@ -1,0 +1,598 @@
+---
+title: "STAT-S 610: Final Project"
+author: "Luis Navarro"
+date: "December 2022"
+output:
+  slidy_presentation: default
+  ioslides_presentation: default
+---
+
+
+```{r,eval=TRUE,echo=FALSE,include=FALSE,tidy=TRUE}
+rm(list = ls()) 
+library(rmarkdown)
+library(formatR)
+library(kableExtra)
+library(reshape)
+library(PtProcess)
+library(gtable)
+library(dplyr)
+library(broom)
+library(readr)
+library(tidyverse)
+library(ggplot2)
+library(lattice)
+library(caret)
+library(leaps)
+library(fixest)
+################################################################################
+### Set the environment
+directory <- "C:/Users/luise/OneDrive - Indiana University/Statistical Computing/Final_Project"
+file_psm <- paste(directory, "/Data/county_data_project_psm.csv", sep = "")
+file_did <- paste(directory, "/Data/county_data_project_did.csv", sep = "")
+file_functions <- paste(directory, "/Code/Script_Functions.R", sep = "")
+set.seed(1)
+### Load the functions 
+source(file_functions)
+
+################################################################################
+#### Parameters of the Simulation 
+treatment_year = 2015 
+ate_beta = 7 
+cutoff_treatment_assignment <- rnorm(1, mean = 0.4, sd = 0.15)
+sample_no <- 1000
+################################################################################
+### Load Data for Propensity Score Matching 
+data_psm <- read.csv(file_psm, header = TRUE, sep = ",")
+nfips <- length(data_psm$fips)
+data_psm <- mutate(data_psm, female = popest_fem/popestimate,
+                             some_college = some_college/100,
+                             less_hs = less_hs/100,
+                             hsd = hsd/100, 
+                             college = college/100,
+                             age513 = age513_tot/popestimate,
+                             age1824 = age1824_tot/popestimate,
+                             age2544 = age2544_tot/popestimate,
+                             age4564 = age4564_tot/popestimate,
+                             taxes_pc = 1000*total_taxes/popestimate,
+                             exp_pc = 1000*total_expenditure/popestimate,
+                             currexp = total_current_expend/total_expenditure,
+                             popestimate = popestimate/1000,
+                             unemployment_rate = unemployment_rate/100,
+                             ### Non Random Treatment Assignment -- Complex Non-Linear Data Generating Process
+                             ### Data Generating Process: function of college, female, unemployment_rate, logpop, age513, age4564, taxes_pc, currexp
+                             treat_formula = unemployment_rate*female + sqrt(age4564) + 
+                                             sqrt(taxes_pc/exp_pc) + currexp^2 + 
+                                             log(1 + college) + log(popestimate) + 
+                                             rnorm(nfips, mean = 0, sd = 1),
+                             treat_aux = percent_rank(treat_formula),
+                             ### Deterministic Treatment
+                             treat_det = case_when(treat_aux <= cutoff_treatment_assignment ~ 0,
+                                                   treat_aux > cutoff_treatment_assignment ~ 1),)
+
+### Store Non Random Treatment Assignment 
+treat_det <- data.frame(fips = data_psm$fips, treat_det = data_psm$treat_det)
+
+###############################################################################
+### Load Data for Difference in Difference Analysis 
+data_did <- read.csv(file_did, header = TRUE, sep = ",")
+### Create Fixed Effects 
+fips_unique <- unique(data_did$fips)
+fipsfe <- rnorm(length(fips_unique))
+yr_unique <- unique(data_did$year)
+yrfe <- rnorm(length(yr_unique))
+### Map of Fixed Effects
+fips_fe <- data.frame(fips = fips_unique, fips_fe = fipsfe)
+year_fe <- data.frame(year = yr_unique, year_fe = yrfe)
+### Merge Fixed Effects 
+data_did <- merge(data_did, fips_fe, by = "fips")
+data_did <- merge(data_did, year_fe, by = "year")
+### Non-Random Treatment Assignment 
+data_did <- merge(data_did,  data.frame(fips = data_psm$fips, treat_det = data_psm$treat_det), by = "fips")
+### Create Dataset to Run the Regressions 
+data_did <- mutate(data_did,  logproptax = log(1+property_tax),
+                              prop_tax = property_tax/total_revenue,
+                              post = case_when(data_did$year <= treatment_year ~ 0,
+                                                data_did$year > treatment_year ~ 1),
+                              did = treat_det*post,
+                              epsilon = rnorm(length(data_did$fips)),
+                              ### Create Fake Outcome To do the Simulation
+                              fake_outcome = logproptax + ate_beta*(did) + treat_det + post + fips_fe + year_fe + epsilon)
+
+################################################################################
+### Simulation Study: Adding Predictors  
+### Estimate the Un-weighted Difference in Difference Model
+unweighted_model <- did_model(outcome = "fake_outcome", 
+                              treat_var = "treat_det", treat_period = 2015,
+                              time_var = "year", unit_var = "fips",
+                              weights = NULL, data = data_did)
+################################################################################
+### Simulation Study: how the model performs when I add one variable to the set of predictors 
+psm_dgp <- c("college","popestimate","female","taxes_pc", "exp_pc" ,"unemployment_rate","age4564","currexp")
+simulation_results <- list()
+### Do the Simulation 
+for(k in 1:length(psm_dgp)) {
+###########################
+### Compute the IPW using the Cross Validation Algorithm
+ipw <- psm_weights(outcome = "treat_det", 
+                   predictors = psm_dgp[1:k],
+                   unit_var = "fips", 
+                   data = data_psm)
+### IPW Weights 
+ipw_weights <- subset(ipw[[2]], select = c("fips", "propensity", "ipw"))
+
+### Merge IPW in the DID data set to estimate the model with and without weights 
+data_did_model <- merge(data_did, ipw_weights, by = "fips")
+
+### Estimate the Matched Difference-in-Difference Model. Statistical Inference is done 
+### using the placebo distribution of the treatment variable under the specified model. 
+did_estimation <- did_randomization(outcome = "fake_outcome", 
+              treat_var = "treat_det", treat_period = 2015,
+              time_var = "year", unit_var = "fips",
+              weights = "ipw", data = data_did_model, samples = sample_no)
+
+simulation_results[[k]] <- list(ipw, did_estimation)
+}
+##########################################################3
+
+## Show the Results of the Simulation
+ate <- matrix(data = NA, ncol = length(psm_dgp), nrow = 3)
+for(k in 1:length(psm_dgp)) {
+ate[1,k] <- simulation_results[[k]][[2]][[1]][1,1]
+ate[2,k] <- simulation_results[[k]][[2]][[1]][1,2]
+
+### Which one is the best model? Retrieve the RMSPE from each one 
+ate[3,k] <- simulation_results[[k]][[1]][[3]] 
+}
+
+### Diagnostics of the Simulation 
+### Results from the Simulation
+t(ate) %>% print()
+
+### Which one is the best model? 
+final_comp <- matrix(data = NA, ncol = 2, nrow = 2, 
+                     dimnames = list(c("ATE","SE"), c("Unweighted","IPW")))
+final_comp[1,1] <- unweighted_model$coefficients[[1]]
+final_comp[2,1] <- unweighted_model$se[[1]]
+final_comp[1,2] <- ate[1,ate[3,] == min(ate[3,])] 
+final_comp[2,2] <- ate[2,ate[3,] == min(ate[3,])] 
+final_comp %>% print()
+
+#### Convergence of the Stepwise Regression 
+combinations <- data_build(outcome = "treat_det", 
+                           predictors = psm_dgp, 
+                           unit_var = "fips", 
+                           data = data_psm) %>% length() - 2
+### All RMSPE results 
+### k - model_selection (1) - rmspe_master (2)
+rmspe_all <- list()
+
+
+rmspe_results2 <- simulation_results[[1]][[1]][[1]][[2]] %>% as.data.frame() %>% na.omit()
+convergence_plot2 <- ggplot(rmspe_results2, aes(x = V1, y = V2)) + theme_bw() + geom_line(color="darkblue") + labs(title = "RMSPE Convergence - 2 Predictors", y="RMSPE", x = "Number of Predictors")
+
+rmspe_results4 <- simulation_results[[4]][[1]][[1]][[2]] %>% as.data.frame() %>% na.omit()
+convergence_plot4 <- ggplot(rmspe_results4, aes(x = V1, y = V2)) + theme_bw() + geom_line(color="darkblue") + labs(title = "RMSPE Convergence - 4 Predictors", y="RMSPE", x = "Number of Predictors")
+
+rmspe_results6 <- simulation_results[[6]][[1]][[1]][[2]] %>% as.data.frame() %>% na.omit()
+convergence_plot6 <- ggplot(rmspe_results6, aes(x = V1, y = V2)) + theme_bw() + geom_line(color="darkblue") + labs(title = "RMSPE Convergence - 6 Predictors", y="RMSPE", x = "Number of Predictors")
+
+rmspe_results8 <- simulation_results[[8]][[1]][[1]][[2]] %>% as.data.frame() %>% na.omit()
+convergence_plot8 <- ggplot(rmspe_results8, aes(x = V1, y = V2)) + theme_bw() + geom_line(color="darkblue") + labs(title = "RMSPE Convergence - 8 Predictors", y="RMSPE", x = "Number of Predictors")
+
+```
+
+
+## Background 
+
+- Suppose we want to analyze the effect of a policy intervention/treatment $Treat$ on the population. 
+
+- Ideally, we can estimate the following linear regression model and retrieve the Average Treatment Effect (ATE) by looking at the coefficient estimate of $\theta$.
+
+\begin{equation}
+y_i = \beta_0 + \theta Treat_i + \gamma x_i + e_i
+\end{equation}
+
+- Problem with observational studies is that the treatment is not randomly assigned, so without good control variables $x$ the coefficient estimate of $\theta$ will be biased. 
+
+
+## Solution
+
+- *Difference-in-Difference (DID) model* Treatment vs control group comparison, before and after the intervention. The coefficient of interest is $\beta$ as it retrieves the ATE.
+
+\begin{equation}
+y_{it} = \beta_0 + \theta_1 Treat_i + \theta_2 Post_t  + \beta (Treat_i \times Post_t) + \gamma x_{it} + e_{it}
+\end{equation}
+
+- For this estimates to be accurate, the selection of the control group is crucial. 
+
+- Treatment and control groups should be as good as identical, such that the only observed difference after the intervention could be attributed to the treatment. 
+
+## Improving the control group 
+
+- In practice we can overcome this by running Eq 2 using weighted least squares with Inverse Probability Weights (IPW). 
+
+- These weights are computed estimating a model for the probability of receiving the treatment (i.e. propensity score) using a Logit model. 
+
+\begin{equation}
+Treat_{i} = g(X_i \beta + e_i)  
+\end{equation}
+
+- *My project* implement a forward stepwise regression algorithm to choose the Propensity Score Model (PSM) with highest prediction accuracy. Then use such weights to estimate the DID model and test to which extent it reduced the bias on the ATE estimate. 
+
+
+## Top Down Design 
+
+
+```{r, out.width = "300px"}
+knitr::include_graphics("C:/Users/luise/OneDrive - Indiana University/Statistical Computing/Final_Project/topdown.png")
+```
+
+- Five main functions and one auxiliary function to do statistical inference. 
+
+
+## Notation
+
+- Outcome: independent variable in the regression. 
+- Treatment variable: dummy variable denoting treatment status (=1 if treated). 
+- Post variable: dummy variable equal to one after the intervention. 
+- Time variable $t$: discrete variable measuring time (e.g. year)
+- Unit variable $i$: unit identifier (in my case US counties)
+- Data - DID model: panel data set having observations for outcome $y_{it}$ across units and periods. 
+- Data - PSM model: cross-sectional observations of characteristics $X_i$ that determine treatment assignment. 
+
+
+## Function 1: Randomization Inference for the ATE
+
+```{r,eval=FALSE,echo=TRUE,include=TRUE,tidy=TRUE}
+did_randomization <- function(outcome,treat_var,treat_period,time_var,unit_var,weights,data,samples){
+### Estimate the Difference-in-Difference Model
+baseline_model <- did_model(outcome,treat_var,treat_period,time_var,unit_var,weights,data)
+### Randomization Inference to Compute SE, Conf Int and p-values
+empirical_distribution <- matrix(nrow = samples, ncol = 1)
+i  = 1
+while (i <= samples){
+  ### Create a Placebo treatment that is randomly assigned 
+  data_sample <- random_treatment(unit_var,data)
+  ### Estimate the model with random treatment variable 
+  model_estimate <- did_model(outcome = outcome, 
+                              treat_var = "random_treat",
+                              treat_period = treat_period, 
+                              time_var = time_var, 
+                              unit_var = unit_var, 
+                              weights = weights, 
+                              data = data_sample)
+  empirical_distribution[i,1] <- coef(model_estimate)
+  i = i + 1
+}
+### Average Treatment Effect 
+ate <- coef(baseline_model) %>% as.double()
+### Standard Error: standard deviation from the empirical distribution 
+std_error <- sd(empirical_distribution) %>% as.double()
+### P-value: % of times the placebo treatment effect is larger than the estimated treatment effect 
+pval <- sum(empirical_distribution >= ate)/samples %>% as.double()
+model_results <- data.frame(coefficient = ate, std_error = std_error, pval = pval)
+### Do a graph showing the hypothesis graphically.Density Plot of the Empirical Distribution 
+empirical_distribution <- empirical_distribution %>% as.data.frame() %>% mutate(ATE = ate)
+density_plot <- ggplot(empirical_distribution, aes(x = V1)) + 
+  geom_density(alpha=0.25) + 
+  geom_vline(aes(xintercept=mean(ATE)), color = "red", linetype = "dashed") +
+  theme_bw() + geom_density(color="darkblue") +
+  labs(title = "Placebo Distribution of the Average Treatment Effect", y="Density", x = "Parameter Estimate")
+### Output as a list, with a DF with the results and the graph
+ouput <- list(model_results, density_plot)
+return(ouput)
+}
+```
+
+Auxiliary Function: Create a placebo treatment that is randomly assigned to the population. 
+
+```{r,eval=FALSE,echo=TRUE,include=TRUE,tidy=TRUE}
+random_treatment <- function(unit_var,data){
+  data_treat <- data 
+  names(data_treat)[which(colnames(data_treat) == unit_var)] <- "unit_var"
+  ### Get A list of unique treatment units
+  treat_units <- unique(data_treat$unit_var)
+  ### Create a fake random treatment 
+  random_treat <- round(runif(length(treat_units)))
+  ### Map of Randomized Treatment
+  random_assignment <- data.frame(unit_var = treat_units, random_treat = random_treat)
+  ### Merge with the data set 
+  data_treat <- merge(data_treat, random_assignment, by = "unit_var")
+  return(data_treat)
+}
+```
+
+
+## Function 2: Estimate the ATE through a DID model. 
+
+```{r,eval=FALSE,echo=TRUE,include=TRUE,tidy=TRUE}
+### Difference in difference regression model 
+did_model <- function(outcome,treat_var,treat_period,time_var,unit_var,weights,data){
+  ### Rename Variables For Simplicity and consistency. 
+  data_model <- data    ### Define object inside the function env to avoid writing in the input.
+  names(data_model)[which(colnames(data_model) == outcome)] <- "outcome"
+  names(data_model)[which(colnames(data_model) == treat_var)] <- "treat_var"
+  names(data_model)[which(colnames(data_model) == time_var)] <- "time_var"
+  names(data_model)[which(colnames(data_model) == unit_var)] <- "unit_var"
+  ### If missing weights, assign equal weights such that WLS = OLS  
+  if(is.null(weights)) {
+    uniform_weights <- rep(1, length(data_model$unit_var))
+    data_model <- mutate(data_model, weights = uniform_weights)
+  } else {
+    names(data_model)[which(colnames(data_model) == weights)] <- "weights"
+  }
+
+  ### Create Post Variable for the DID Model
+  data_model <- mutate(data_model, time_post = case_when(data_model$time_var <= treat_period ~ 0,
+                                                         data_model$time_var > treat_period ~ 1),
+                       did_var = treat_var*time_post)
+  ### Estimate the Regression Model with IP weights 
+  model_did <- feols(outcome ~ did_var | unit_var + time_var, data = data_model, weights = ~ weights) 
+  return(model_did)
+}
+```
+
+
+## Function 3. Estimate the Propensity Score Model 
+
+- Note: for this function the outcome is not $y_{it}$. It is $Treat_i$ because we are estimating the propensity score model. 
+
+```{r,eval=FALSE,echo=TRUE,include=TRUE,tidy=TRUE}
+psm_weights <- function(outcome,predictors,unit_var,data) {
+### Get the model with highest accuracy 
+model <- model_selection(outcome, predictors, unit_var, data)
+### Optimal set of predictor variables 
+predictor_star <- model[[1]]
+### Build the data set to run the PS models. 
+reg_data <- data_build(outcome, predictors, unit_var, data)
+### Get the data set with the chosen variables 
+data_build_psm <- subset(reg_data, select = c("outcome", unit_var, predictor_star))
+### PSM Formula
+reg_form <- as.formula(paste("outcome", paste(predictor_star, collapse = " + "), 
+                             sep = " ~ "))
+### Estimate the Propensity Score Model
+psm_model <- glm(reg_form, data = data_build_psm, 
+                 family = binomial(link = "logit"))
+# Generate propensity scores and IPWs
+psm_weights <- data_build_psm %>% mutate(propensity = psm_model$fitted.values) %>% 
+                        mutate(ipw = ifelse(outcome == 1, 1/propensity, 1/(1-propensity)))
+### Compute the Prediction Error of the Model 
+data_results <- data_build_psm %>% mutate(predicted = psm_model$fitted.values) %>% 
+  mutate(outcome = as.double(outcome)) %>% 
+  mutate(sq_error = (outcome - predicted)^2) 
+
+### Accuracy Metric: Root Mean Squared Prediction Error 
+rmspe <- data_results$sq_error %>% mean() %>% sqrt()
+### Return Data Frame with Unit Var and IPW weights 
+psm_results <- list(model, psm_weights, rmspe)
+return(psm_results)
+```
+
+## Function 4. Forward Stepwise Selection Model Selection
+
+```{r,eval=FALSE,echo=TRUE,include=TRUE,tidy=TRUE}
+model_selection <- function(outcome,predictors,unit_var,data){
+### Build data set with organized variables to test the model. 
+reg_data <- data_build(outcome,predictors,unit_var,data)
+### Initial Set of Predictors: all variables but the outcome and the id variable.
+predictors_i <- colnames(reg_data)[-which(colnames(reg_data) == c("outcome") | colnames(reg_data) == c(unit_var))] 
+pred_no <- length(predictors_i) ### Number of predictors to test 
+predictor_star <- NULL  ### Empty vector to store the chosen predictors 
+rmspe_master  <- matrix(data = NA, nrow = pred_no, ncol = 2)  ## Empty matrix to store the accuracy of each model 
+rmspe_old = 1000 ### Arbitrarily chosen large prediction error.  
+j = 1
+### The Loop will run until we ran out of possible predictor variables. This is an forward stepwise selection algorithm. It begins with a simple univariate regression
+### and iteratively augments the model by choosing the variable that improves more the RMSPE. If there is no improvement, then break the loop and return the model. 
+while(pred_no > 0) {
+rmspe <- matrix(data = NA, nrow = pred_no, ncol = 3)
+for(i in 1:pred_no) {
+### Model Definition 
+data_subset <- subset(reg_data, select = c("outcome", predictor_star, predictors_i[i]))
+### Estimate the logit model with all the variables in the data set. 
+psm_model <- glm(outcome ~ ., data = data_subset, family = binomial(link = "logit"))
+### Store Predicted Values and compute the Squared Prediction Error 
+data_results <- data_subset %>% mutate(predicted = psm_model$fitted.values) %>% 
+                               mutate(outcome = as.double(outcome)) %>% 
+                               mutate(sq_error = (outcome - predicted)^2) 
+              
+### Accuracy Metric: Root Mean Squared Prediction Error 
+rmspe_new <- data_results$sq_error %>% mean() %>% sqrt()
+rmspe[i,1] <- i   ### Store the Results of the RMSPE for each estimated model 
+rmspe[i,2] <- rmspe_new  ### Store the Accuracy of the model. 
+rmspe[i,3] <- rmspe_old - rmspe_new  ### Compute the Accuracy Improvement relative to the previous lap of the loop 
+}
+
+### Store Outer Loop Results
+rmspe_master[j,1] <- j
+rmspe_master[j,2] <- min(rmspe[,2])
+### Choose the Model with highest accuracy improvement
+model_index <- rmspe[which(rmspe[,3] == max(rmspe[,3])),1]
+### Choose the predictor with highest accuracy
+predictor_star <- c(predictor_star, predictors_i[model_index])
+### Update the Number of Remaining Predictors 
+predictors_i <- predictors_i[-model_index]
+pred_no <- length(predictors_i)
+### Break if adding a variable did not improved prediction accuracy 
+delta_rmspe <- rmspe_old -  min(rmspe[,2])
+if(delta_rmspe <= 0){
+  break 
+}
+rmspe_old <- min(rmspe[,2])   ### Define rmspe old for the new loop 
+j = j + 1   ### Add one to the counter 
+}
+results <- list(predictor_star,rmspe_master)
+return(results)
+}
+```
+
+
+## Function 5: Build dataset to estimate PSM models
+
+
+```{r,eval=FALSE,echo=TRUE,include=TRUE,tidy=TRUE}
+data_build <- function(outcome,predictors,unit_var,data){
+  full_data <- data %>% na.omit()   ### Cleaning 
+  names(full_data)[which(colnames(full_data) == outcome)] <- "outcome"   ### Rename outcome
+  full_data$outcome <- as.factor(full_data$outcome)
+  unit_var <- subset(full_data, select = unit_var)
+  ### Outcome has the name of the outcome variable 
+  y <- subset(full_data, select = outcome)
+  ### Predictors is a vector with the names of all the variables that will be used as predictors 
+  x <- subset(full_data, select = predictors)
+  #### Squared Predictors 
+  x2 <- x^2
+  colnames(x2) <- paste0(colnames(x),'.sq')
+  ### Predictors in Inverse Hyperbolic Sin Function  
+  xasinh <- asinh(x)
+  colnames(xasinh) <- paste0(colnames(x),'asinh')
+  ### Interaction Terms and Intercept  
+  interactions <- model.matrix( ~ .^2, data = x)
+  inter_var <- interactions[,-which(colnames(interactions) == "(Intercept)")] %>% as.data.frame()
+  ### Weird thing happening with the variable names when there is only one predictor 
+  if(length(predictors) == 1){
+    names(inter_var) <- predictors
+  }
+  regdata <- data.frame(unit_var, y, inter_var, x2, xasinh)  ### Return Dataframe with ordered variables 
+  return(regdata)
+}
+```
+
+
+## Implementation
+
+- I use data from the Annual Census of Local Government Finances and other sources to build a data set with observations for 1100 counties in the US between 2010 and 2020. 
+
+- I create a non-random treatment assignment rule. Intuitively, the stepwise regression algorithm will try to identify this Data Generating Process. 
+
+- $Treat_i = h(X_i) + e_i$ If $h(X_i) > h^*$, then the unit is treated. 
+
+- In theory, if treatment is not randomly assigned OLS regression should be biased, and WLS with the IPW should alleviate such bias. 
+
+- The challenge: if the Logit model is specified incorrectly, it could increase the prevailing bias in the estimate. 
+
+
+## Parameters of the Simulation 
+
+```{r,eval=FALSE,echo=TRUE,include=TRUE,tidy=TRUE}
+treatment_year = 2015  ### 5 periods before and after for comparison 
+ate_beta = 7  ### ATE = 7 
+cutoff_treatment_assignment <- rnorm(1, mean = 0.4, sd = 0.15) 
+sample_no <- 1000 ### Sample size of the placebo distribution for inference 
+```
+
+- Non-random treatment assignment. 
+
+```{r,eval=FALSE,echo=TRUE,include=TRUE,tidy=TRUE}
+### Non Random Treatment Assignment -- Complex Non-Linear Data Generating Process function of college, female, unemployment_rate, population, age513, age4564, taxes_pc, currexp
+treat_formula = unemployment_rate*female + sqrt(age4564) + sqrt(taxes_pc/exp_pc) + currexp^2 + 
+                log(1 + college) + log(popestimate) + rnorm(nfips, mean = 0, sd = 1),
+treat_aux = percent_rank(treat_formula),
+### If above the cutoff, the county is treated
+treat_det = case_when(treat_aux <= cutoff_treatment_assignment ~ 0,
+                      treat_aux > cutoff_treatment_assignment ~ 1),)
+```
+
+- To estimate the model, I create a fake outcome with the ATE defined above. For reference, I use the log of the property tax revenue collected by counties. $did = treat \times post$. So I know the true value of $\beta = 7$. 
+
+```{r,eval=FALSE,echo=TRUE,include=TRUE,tidy=TRUE}
+fake_outcome = logproptax + ate_beta*(did) + treat_det + post + fips_fe + year_fe + epsilon)
+```
+
+- Composition of the treatment and control group in the simulation 
+
+```{r,eval=TRUE,echo=TRUE,include=TRUE,tidy=TRUE}
+data_psm$treat_det %>% table()
+```
+
+## Results from the Stepwise Regression Algorithm 
+
+- I will iteratively augment the PS model by increasing the set of variables from which is choosing. 
+
+```{r,eval=FALSE,echo=TRUE,include=TRUE,tidy=TRUE}
+psm_dgp <- c("college","popestimate","female","taxes_pc", "exp_pc" ,"unemployment_rate","age4564","currexp")
+simulation_results <- list()
+### Do the Simulation 
+for(k in 1:length(psm_dgp)) {
+ipw <- psm_weights(outcome = "treat_det", predictors = psm_dgp[1:k],
+                   unit_var = "fips", data = data_psm)
+### IPW Weights 
+ipw_weights <- subset(ipw[[2]], select = c("fips", "propensity", "ipw"))
+### Merge IPW in the DID data set to estimate the model with and without weights 
+data_did_model <- merge(data_did, ipw_weights, by = "fips")
+### Estimate the Matched Difference-in-Difference Model. Statistical Inference is done 
+### using the placebo distribution of the treatment variable under the specified model. 
+did_estimation <- did_randomization(outcome = "fake_outcome", 
+              treat_var = "treat_det", treat_period = 2015,
+              time_var = "year", unit_var = "fips",
+              weights = "ipw", data = data_did_model, samples = sample_no)
+simulation_results[[k]] <- list(ipw, did_estimation)
+}
+```
+
+- The following graphs show how the RMSPE decreases as the algorithm chooses the predictors optimally. 
+
+- As the number of predictors increase, so the possible combinations and interactions in which they could appear. 
+
+```{r,eval=TRUE,echo=TRUE,include=TRUE,tidy=TRUE}
+print(convergence_plot2) 
+print(convergence_plot4)
+print(convergence_plot6) 
+print(convergence_plot8)
+```
+
+## Results from the Simulation 
+
+
+- Estimate the DID Unweighted model. 
+
+```{r,eval=TRUE,echo=TRUE,include=TRUE,tidy=TRUE}
+### Estimate the Un-weighted Difference in Difference Model
+unweighted_model <- did_model(outcome = "fake_outcome", 
+                              treat_var = "treat_det", treat_period = 2015,
+                              time_var = "year", unit_var = "fips",
+                              weights = NULL, data = data_did)
+unweighted_model %>% summary()
+```
+
+- 
+
+```{r,eval=TRUE,echo=TRUE,include=TRUE,tidy=TRUE}
+### Results from the Simulation
+t(ate) %>% print() 
+```
+
+- Choose the best model according to the RMSPE criterion. As we can see, it alleviates the bias. 
+
+```{r,eval=TRUE,echo=TRUE,include=TRUE,tidy=TRUE}
+### Which one is the best model? 
+final_comp <- matrix(data = NA, ncol = 2, nrow = 2, 
+                     dimnames = list(c("ATE","SE"), c("Unweighted","IPW")))
+final_comp[1,1] <- unweighted_model$coefficients[[1]]
+final_comp[2,1] <- unweighted_model$se[[1]]
+final_comp[1,2] <- ate[1,ate[3,] == min(ate[3,])] 
+final_comp[2,2] <- ate[2,ate[3,] == min(ate[3,])] 
+final_comp %>% print()
+```
+
+- Randomization Inference results: 
+
+```{r,eval=TRUE,echo=TRUE,include=TRUE,tidy=TRUE}
+stat_inference_graph <- simulation_results[[8]][[2]][[2]] 
+print(stat_inference_graph)
+```
+
+
+## Challenges and Next Steps
+
+- The algorithm is unstable. For some parameters of the simulation, it does not improve prediction accuracy. 
+
+- Depends on the complexity of the treatment assignment rule/DGP and the threshold. Also, on the size of the ATE. For smaller values of the $ATE$ it gets harder to get statistical significance. 
+
+- For this version, I am restraining to explore straightforward ways in which variables could interact. 
+
+- Double check the randomization inference function. While I use a uniform random variable for random assignment, sometimes I observe multimodal distribution. 
+
+- You can check older implementations and current progress here: https://github.com/LuisNavarro07/stat610_finalproject 
+
+
