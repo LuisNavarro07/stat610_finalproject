@@ -4,7 +4,7 @@
 ### Final Project 
 ### Matched Difference-in-Difference 
 ### Author: Luis Navarro
-### This Version: November 24, 2022
+### This Version: December 15, 2022
 ### Script: Functions for the Implementation 
 ################################################################################
 ################################################################################
@@ -13,7 +13,12 @@
 ################################################################################
 ### Randomization Inference: Estimate the Regression Model (with the weights fixed), by create a fake treatment variable
 ### that randomly assigns the treatment. 
+#' @export
 did_randomization <- function(outcome,treat_var,treat_period,time_var,unit_var,weights,data,samples){
+if(missing(samples)) {
+  warning('number of samples not defined. Default is 100')
+  samples <- 100 
+}
 ### Baseline Estimation
 baseline_model <- did_model(outcome,treat_var,treat_period,time_var,unit_var,weights,data)
 ### Randomization Inference
@@ -41,8 +46,17 @@ std_error <- sd(empirical_distribution) %>% as.double()
 ### P-value: proportion of times the placebo treatment effect is larger than the estimated treatment effect 
 pval <- sum(empirical_distribution >= ate)/samples %>% as.double()
 model_results <- data.frame(coefficient = ate, std_error = std_error, pval = pval)
-### Do a graph showing the hypothesis graphically 
+### Include the Average Treatment Effect as a variable in the empirical distribution function
 empirical_distribution <- empirical_distribution %>% as.data.frame() %>% mutate(ATE = ate)
+ouput <- list(model_results, empirical_distribution)
+return(ouput)
+}
+
+################################################################################
+### Function 1.1 Show the Empirical Density of the Placebo Distribution 
+#' @export
+ate_inference_graph <- function(empirical_distribution) {
+### Do a graph showing the hypothesis graphically 
 ### Density Plot of the Empirical Distribution 
 density_plot <- ggplot(empirical_distribution, aes(x = V1)) + 
   geom_density(alpha=0.25) + 
@@ -51,14 +65,25 @@ density_plot <- ggplot(empirical_distribution, aes(x = V1)) +
   labs(title = "Placebo Distribution of the Average Treatment Effect", y="Density", x = "Parameter Estimate") + 
   scale_color_manual(name = "Estimate")
 print(density_plot)
-ouput <- list(model_results, density_plot)
-return(ouput)
+return(density_plot)
 }
 
 ### Function 2: Estimate the Difference-in-Difference Model 
 ################################################################################
 ### Difference in difference regression model 
+#' @export
 did_model <- function(outcome,treat_var,treat_period,time_var,unit_var,weights,data){
+  ### Stop if inputs are not defined 
+  if(missing(outcome)) {stop('outcome variable not defined')}
+  if(missing(treat_var)) {stop('treatment variable not defined')}
+  if(missing(treat_period)) {stop('intervention period not specified')}
+  if(missing(time_var)) {stop('time_var not defined')}
+  if(missing(unit_var)) {stop('unit_var not defined')}
+  if(missing(weights)) {warning('ipw not specified. Equal weights assumed.')
+    weights = NULL}
+  if(missing(data)) {stop('data not found')}
+  #### Stop if time var is not double 
+  if(is.double(treat_period) == FALSE) {stop('treat_period is not double')}
   ### Build the Variables to run the Difference-in-Difference Model
   ### Rename Variables For Simplicity
   data_model <- data
@@ -87,6 +112,7 @@ did_model <- function(outcome,treat_var,treat_period,time_var,unit_var,weights,d
 
 ### Function 3: Create a Random Assignment in Treatment 
 ################################################################################
+#' @export
 random_treatment <- function(unit_var,data){
   data_treat <- data 
   names(data_treat)[which(colnames(data_treat) == unit_var)] <- "unit_var"
@@ -104,6 +130,7 @@ random_treatment <- function(unit_var,data){
 
 ### Function 4: Estimate the Propensity Score Model   
 ################################################################################
+#' @export
 psm_weights <- function(outcome,predictors,unit_var,data) {
 ### Get the model with highest accuracy 
 model <- model_selection(outcome, predictors, unit_var, data)
@@ -140,6 +167,7 @@ return(psm_results)
 ################################################################################
 ### Function 5: Model Selection for Propensity Score Matching  
 ################################################################################
+#' @export
 model_selection <- function(outcome,predictors,unit_var,data){
 ### Build data set with organized variables. This data set should only include the chosen predictors
 ### the predictors squared, interactions across predictors, and the outcome 
@@ -165,15 +193,12 @@ for(i in 1:pred_no) {
 data_subset <- subset(reg_data, select = c("outcome",
                                              predictor_star,
                                              predictors_i[i]))
-### Try a simpler version of this. I don't need to do Cross Validation. 
-### I just to choose the variable with more predictive power. 
 ### Estimate the logit model 
 psm_model <- glm(outcome ~ ., data = data_subset, family = binomial(link = "logit"))
 ### Store Predicted Values and compute the Squared Prediction Error 
 data_results <- data_subset %>% mutate(predicted = psm_model$fitted.values) %>% 
                                mutate(outcome = as.double(outcome)) %>% 
                                mutate(sq_error = (outcome - predicted)^2) 
-              
 ### Accuracy Metric: Root Mean Squared Prediction Error 
 rmspe_new <- data_results$sq_error %>% mean() %>% sqrt()
 ### Store the Results of the RMSPE for each estimated model 
@@ -213,17 +238,18 @@ return(results)
 
 ### Function 6: Build Data set To Estimate Iteratively the Propensity Score Model 
 ################################################################################
+#' @export
 data_build <- function(outcome,predictors,unit_var,data){
-  ### Partition the data set in order to do the cross validation 
+  ### Stop if inputs are not defined 
+  if(missing(outcome)) {stop('outcome variable not defined')}
+  if(missing(predictors)) {stop('predictor variables not defined')}
+  if(missing(unit_var)) {stop('unit_var not defined')}
+  if(missing(data)) {stop('data not found')}
+  ### Exlcude Ommited Ovservations 
   full_data <- data %>% na.omit()
   ### Rename outcome
   names(full_data)[which(colnames(full_data) == outcome)] <- "outcome"
-  #names(full_data)[which(colnames(full_data) == unit_var)] <- "unit_var"
   full_data$outcome <- as.factor(full_data$outcome)
-  ### Do the partition between training and testing data
-  #partition_dataset <- createDataPartition(y = full_data$outcome, p = 0.5 , list = FALSE, times = 1)
-  #training <- full_data[partition_dataset,]
-  ### unit_var
   unit_var <- subset(full_data, select = unit_var)
   ### Outcome has the name of the outcome variable 
   y <- subset(full_data, select = outcome)
@@ -232,7 +258,7 @@ data_build <- function(outcome,predictors,unit_var,data){
   #### Squared Predictors 
   x2 <- x^2
   colnames(x2) <- paste0(colnames(x),'.sq')
-  ### Predictors in Inversge Hyperbolic Sin Function  
+  ### Predictors in Inverse Hyperbolic Sin Function  
   xasinh <- asinh(x)
   colnames(xasinh) <- paste0(colnames(x),'asinh')
   ### Interaction Terms and Intercept  

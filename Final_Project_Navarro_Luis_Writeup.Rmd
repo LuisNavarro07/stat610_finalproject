@@ -1,0 +1,492 @@
+---
+title: "STAT-S 610 Final Project: A Forward Stepwise Regression Approach for Matched Difference-in-Differences Models"
+author: "Luis Navarro"
+date: "December 15, 2022"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+```{r,eval=TRUE,echo=FALSE,include=FALSE,tidy=FALSE}
+rm(list = ls()) 
+pacman::p_load(rmarkdown, formatR, kableExtra, reshape, gtable, PtProcess, dplyr, broom, readr, tidyverse, ggplot2, gridExtra, lattice, leaps, fixest, cli, testthat)
+
+################################################################################
+### Set the environment
+directory <- "C:/Users/luise/OneDrive - Indiana University/Statistical Computing/Final_Project"
+file_psm <- paste(directory, "/Data/county_data_project_psm.csv", sep = "")
+file_did <- paste(directory, "/Data/county_data_project_did.csv", sep = "")
+file_functions <- paste(directory, "/Code/Script_Functions.R", sep = "")
+set.seed(1)
+### Load the functions 
+source(file_functions)
+################################################################################
+#### Parameters of the Simulation 
+treatment_year = 2015 
+cutoff_treatment_assignment <- rnorm(1, mean = 0.4, sd = 0.15)
+sample_no <- 1000
+ate_beta = 7
+### Vector of Predictor Variables to choose from 
+psm_dgp <- c("college","popestimate","female","taxes_pc", "exp_pc" ,"unemployment_rate","age4564","currexp")
+################################################################################
+### Data Cleaning 
+### Load Data for Propensity Score Matching 
+data_psm <- read.csv(file_psm, header = TRUE, sep = ",")
+nfips <- length(data_psm$fips)
+data_psm <- mutate(data_psm, female = popest_fem/popestimate,
+                             some_college = some_college/100,
+                             less_hs = less_hs/100,
+                             hsd = hsd/100, 
+                             college = college/100,
+                             age513 = age513_tot/popestimate,
+                             age1824 = age1824_tot/popestimate,
+                             age2544 = age2544_tot/popestimate,
+                             age4564 = age4564_tot/popestimate,
+                             taxes_pc = 1000*total_taxes/popestimate,
+                             exp_pc = 1000*total_expenditure/popestimate,
+                             currexp = total_current_expend/total_expenditure,
+                             popestimate = popestimate/1000,
+                             unemployment_rate = unemployment_rate/100,
+                             ### Non Random Treatment Assignment -- Complex Non-Linear Data Generating Process
+                             ### Data Generating Process: function of college, female, unemployment_rate, logpop, age513, age4564, taxes_pc, currexp
+                             treat_formula = unemployment_rate*female + sqrt(age4564) + 
+                                             sqrt(taxes_pc/exp_pc) + currexp^2 + 
+                                             log(1 + college) + log(popestimate) + 
+                                             rnorm(nfips, mean = 0, sd = 1),
+                             treat_aux = percent_rank(treat_formula),
+                             ### Deterministic Treatment
+                             treat_det = case_when(treat_aux <= cutoff_treatment_assignment ~ 0,
+                                                   treat_aux > cutoff_treatment_assignment ~ 1),)
+
+### Store Non Random Treatment Assignment 
+treat_det <- data.frame(fips = data_psm$fips, treat_det = data_psm$treat_det)
+##########
+### Load Data for Difference in Difference Analysis 
+data_did <- read.csv(file_did, header = TRUE, sep = ",")
+### Create Fixed Effects 
+fips_unique <- unique(data_did$fips)
+fipsfe <- rnorm(length(fips_unique))
+yr_unique <- unique(data_did$year)
+yrfe <- rnorm(length(yr_unique))
+### Map of Fixed Effects
+fips_fe <- data.frame(fips = fips_unique, fips_fe = fipsfe)
+year_fe <- data.frame(year = yr_unique, year_fe = yrfe)
+### Merge Fixed Effects 
+data_did <- merge(data_did, fips_fe, by = "fips")
+data_did <- merge(data_did, year_fe, by = "year")
+### Non-Random Treatment Assignment 
+data_did <- merge(data_did,  data.frame(fips = data_psm$fips, treat_det = data_psm$treat_det), by = "fips")
+
+### Create Dataset to Run the Regressions 
+data_did <- mutate(data_did,  logproptax = log(1+property_tax),
+                              prop_tax = property_tax/total_revenue,
+                              post = case_when(data_did$year <= treatment_year ~ 0,
+                                                data_did$year > treatment_year ~ 1),
+                              did = treat_det*post,
+                              epsilon = rnorm(length(data_did$fips)),
+                              ### Create Fake Outcome To do the Simulation
+                              fake_outcome = logproptax + ate_beta*(did) + treat_det + 
+                              post + fips_fe + year_fe + epsilon)
+
+################################################################################
+### Simulation Study: Adding Predictors  
+### Estimate the Un-weighted Difference in Difference Model
+unweighted_model_baseline <- did_model(outcome = "fake_outcome", 
+                              treat_var = "treat_det", treat_period = 2015,
+                              time_var = "year", unit_var = "fips",
+                              weights = NULL, data = data_did)
+################################################################################
+#### Baseline Scenario 
+### Simulation Study: how the model performs when I add one variable to the set of predictors 
+simulation_results <- list()
+### Do the Simulation 
+for(k in 1:length(psm_dgp)) {
+###########################
+### Compute the IPW using the Cross Validation Algorithm
+ipw <- psm_weights(outcome = "treat_det", 
+                   predictors = psm_dgp[1:k],
+                   unit_var = "fips", 
+                   data = data_psm)
+### IPW Weights 
+ipw_weights <- subset(ipw[[2]], select = c("fips", "propensity", "ipw"))
+
+### Merge IPW in the DID data set to estimate the model with and without weights 
+data_did_model <- merge(data_did, ipw_weights, by = "fips")
+
+### Estimate the Matched Difference-in-Difference Model. Statistical Inference is done 
+### using the placebo distribution of the treatment variable under the specified model. 
+did_estimation <- did_randomization(outcome = "fake_outcome", 
+              treat_var = "treat_det", treat_period = 2015,
+              time_var = "year", unit_var = "fips",
+              weights = "ipw", data = data_did_model, samples = sample_no)
+
+simulation_results[[k]] <- list(ipw, did_estimation)
+}
+##########################################################3
+
+## Show the Results of the Simulation
+ate <- matrix(data = NA, ncol = length(psm_dgp), nrow = 3)
+for(k in 1:length(psm_dgp)) {
+ate[1,k] <- simulation_results[[k]][[2]][[1]][1,1]
+ate[2,k] <- simulation_results[[k]][[2]][[1]][1,2]
+
+### Which one is the best model? Retrieve the RMSPE from each one 
+ate[3,k] <- simulation_results[[k]][[1]][[3]] 
+}
+
+### Diagnostics of the Simulation 
+### Results from the Simulation
+results_baseline <- t(ate) %>% as.data.frame() %>% na.omit()
+names(results_baseline) <- c("ATE", "SE", "RMSPE")
+
+
+### Which one is the best model? 
+final_comp <- matrix(data = NA, ncol = 2, nrow = 2, 
+                     dimnames = list(c("ATE","SE"), c("Unweighted","IPW")))
+final_comp[1,1] <- unweighted_model_baseline$coefficients[[1]]
+final_comp[2,1] <- unweighted_model_baseline$se[[1]]
+final_comp[1,2] <- ate[1,ate[3,] == min(ate[3,])] 
+final_comp[2,2] <- ate[2,ate[3,] == min(ate[3,])] 
+
+
+#### Convergence of the Stepwise Regression 
+combinations <- data_build(outcome = "treat_det", 
+                           predictors = psm_dgp, 
+                           unit_var = "fips", 
+                           data = data_psm) %>% length() - 2
+### All RMSPE results 
+### k - model_selection (1) - rmspe_master (2)
+rmspe_all <- list()
+
+
+### Do the graphs the ATE hypothesis Test
+emp_dist <- simulation_results[[7]][[2]][[2]]
+ate_graph <- ate_inference_graph(emp_dist)
+
+### Do the graphs of the convergence 
+rmspe_results2 <- simulation_results[[1]][[1]][[1]][[2]] %>% as.data.frame() %>% na.omit()
+convergence_plot2 <- ggplot(rmspe_results2, aes(x = V1, y = V2)) + theme_bw() + geom_line(color="darkblue") + labs(title = "RMSPE Convergence - 2 Predictors", y="RMSPE", x = "Number of Predictors")
+
+rmspe_results4 <- simulation_results[[4]][[1]][[1]][[2]] %>% as.data.frame() %>% na.omit()
+convergence_plot4 <- ggplot(rmspe_results4, aes(x = V1, y = V2)) + theme_bw() + geom_line(color="darkblue") + labs(title = "RMSPE Convergence - 4 Predictors", y="RMSPE", x = "Number of Predictors")
+
+rmspe_results6 <- simulation_results[[6]][[1]][[1]][[2]] %>% as.data.frame() %>% na.omit()
+convergence_plot6 <- ggplot(rmspe_results6, aes(x = V1, y = V2)) + theme_bw() + geom_line(color="darkblue") + labs(title = "RMSPE Convergence - 6 Predictors", y="RMSPE", x = "Number of Predictors")
+
+rmspe_results8 <- simulation_results[[8]][[1]][[1]][[2]] %>% as.data.frame() %>% na.omit()
+convergence_plot8 <- ggplot(rmspe_results8, aes(x = V1, y = V2)) + theme_bw() + geom_line(color="darkblue") + labs(title = "RMSPE Convergence - 8 Predictors", y="RMSPE", x = "Number of Predictors")
+
+#### Simulation Test of the Precision of the Algorithm across different values of the ATE. 
+
+#################
+#### Simulation based tests: how well the algorithm works for different values of the ATE 
+#### Simulation Parameters 
+### Vector of Predictor Variables to choose from 
+
+### Load Data for Difference in Difference Analysis 
+data_did <- read.csv(file_did, header = TRUE, sep = ",")
+### Create Fixed Effects 
+fips_unique <- unique(data_did$fips)
+fipsfe <- rnorm(length(fips_unique))
+yr_unique <- unique(data_did$year)
+yrfe <- rnorm(length(yr_unique))
+### Map of Fixed Effects
+fips_fe <- data.frame(fips = fips_unique, fips_fe = fipsfe)
+year_fe <- data.frame(year = yr_unique, year_fe = yrfe)
+### Merge Fixed Effects 
+data_did <- merge(data_did, fips_fe, by = "fips")
+data_did <- merge(data_did, year_fe, by = "year")
+### Non-Random Treatment Assignment 
+data_did <- merge(data_did,  data.frame(fips = data_psm$fips, treat_det = data_psm$treat_det), by = "fips")
+data_did <- mutate(data_did,  logproptax = log(1+property_tax),
+                   prop_tax = property_tax/total_revenue,
+                   post = case_when(data_did$year <= treatment_year ~ 0,
+                                    data_did$year > treatment_year ~ 1),
+                   did = treat_det*post)
+##########
+#### Different Values for the ATE Beta 
+ate_random <- runif(100, min = 1, max = 10) %>% round(digits = 2)
+## Do the Simulation
+test_sim_res <- list()
+for(k in 1:length(ate_random)) {
+### Create Fake Outcome To do the Simulation 
+ate_beta <- ate_random[k]
+
+data_did_sim <- data_did %>% mutate(epsilon = rnorm(length(data_did$fips)),
+                                    fake_outcome = logproptax + ate_beta*(did) + treat_det + 
+                     post + fips_fe + year_fe + epsilon)
+
+### Unweighted Model 
+unweighted_model <- did_model(outcome = "fake_outcome", 
+                              treat_var = "treat_det", treat_period = 2015,
+                              time_var = "year", unit_var = "fips",
+                              weights = NULL, data = data_did_sim)
+### Unweighted Beta 
+unw_beta <- coef(unweighted_model)
+### Compute the IPWs    
+ipw <- psm_weights(outcome = "treat_det", 
+                   predictors = psm_dgp[1:4],
+                   unit_var = "fips", 
+                   data = data_psm)
+### IPW Weights 
+ipw_weights <- subset(ipw[[2]], select = c("fips", "propensity", "ipw"))
+### Merge IPW in the DID data set to estimate the model with and without weights 
+data_did_model <- merge(data_did_sim, ipw_weights, by = "fips")
+### Estimate the Matched Difference-in-Difference Model. Statistical Inference is done 
+### using the placebo distribution of the treatment variable under the specified model. 
+did_estimation <- did_randomization(outcome = "fake_outcome", 
+                                    treat_var = "treat_det", treat_period = 2015,
+                                    time_var = "year", unit_var = "fips",
+                                    weights = "ipw", data = data_did_model, samples = 1)
+### IPW BETA 
+weight_beta <- did_estimation[[1]][[1]]
+
+prediction_error1 <- (unw_beta - weight_beta)^2
+prediction_error2 <- (ate_beta - weight_beta)^2
+test_sim_res[[k]] <- list(ipw, did_estimation, prediction_error1, prediction_error2)
+}
+##########################################################3
+
+## Show the Results of the Simulation
+ate_error <- matrix(data = NA, nrow = length(ate_random), ncol = 2)
+for(k in 1:length(ate_random)) {
+  ate_error[k,1] <- test_sim_res[[k]][[3]][[1]]
+  ate_error[k,2] <- test_sim_res[[k]][[4]][[1]]
+}
+
+
+#### Graphs Showing the Distribution of the Prediction Error 
+emp_dist_error1 <- ate_error[,1] %>% as.data.frame()
+names(emp_dist_error1) <- c("V1")
+rmspe1_dist <- ggplot(emp_dist_error1, aes(x = V1)) + 
+  geom_density(alpha=0.25) + 
+  theme_bw() + geom_density(color="darkblue") +
+  labs(title = "Prediction Error 1: Unweighted vs Weighted", y="Density", x = "Squared Error")
+
+
+emp_dist_error2 <- ate_error[,2] %>% as.data.frame()
+names(emp_dist_error2) <- c("V1")
+rmspe2_dist <- ggplot(emp_dist_error2, aes(x = V1)) + 
+  geom_density(alpha=0.25) + 
+  theme_bw() + geom_density(color="darkblue") +
+  labs(title = "Prediction Error 2: True ATE vs Weighted Estimate", y="Density", x = "Squared Error")
+
+
+
+
+#### Comparing the Results 
+rmspe1 <- ate_error[,1] %>% mean() %>% sqrt()
+rmspe2 <- ate_error[,2] %>% mean() %>% sqrt()
+
+pred_errors_results <- data.frame(RMSPE1 = rmspe1, RMSPE2 = rmspe2)
+
+```
+
+\section{Introduction}
+
+Difference-in-difference models are widely used across fields of social science to test the effectiveness of an intervention/policy. Aiming to mimic the experimental setting of a randomized control trial, the difference-in-difference model compares the outcome of interest between two arms/groups: a treatment group and a control group. However, unlike controlled experiments, in observational studies treatment is likely to not be randomly assigned, therefore posing a challenge in terms of identifying the treatment effect through a standard linear regression model of the outcome (as the dependent variable) on the treatment (as the independent variable). To overcome this challenge, we need to make a comparison of the treatment and control groups, before and after the intervention. 
+
+Let $i$ denote units and $t$ periods. Hence, $y_{it}$ denotes outcome variable $y$ for unit $i$ on period $t$. Let $T_i$ be a dummy variable equal to 1 if unit $i$ is in the treatment group and 0 otherwise. Let $t^*$ be the period when the intervention takes place. Denote $P_t$ as a dummy variable equal to 1 if $t \geq t^*$ (i.e. after the intervention) and 0 otherwise. Define $d_{it} = T_i \times P_t$ as the interaction between these two variables. Let $a_i$ be unit fixed-effects (i.e. time-invariant characteristics specific to each unit) and $b_t$ time fixed-effects (i.e. unit-invariant characteristics specific to each period). Let $X_{it}$ be a vector of covariates, and $e_{it}$ a random disturbance. The generalized difference-in-difference model observes the following structure.
+
+\begin{equation}
+    y_{it} = \beta_0 + \beta d_{it} + \gamma X_{it} + a_i + b_t + e_{it}
+    \label{model_did}
+\end{equation}
+
+
+For $\beta$ to retrieve the Average Treatment Effect (ATE) we must satisfy the parallel trends assumption (i.e. the main identification assumption of this research design). Intuitively speaking, the parallel trends assumption requires that in the absence of treatment, the outcome of the treatment group should follow a similar trend to the one observed in the control group. If this holds, hence any differences observed in the outcome of the treatment group after the intervention could be attributed to the treatment. For this assumption to be met, however, the selection of the control group is crucial. In a perfect world, we would like a control group that is identical to the treatment group where the only difference observed between the two could be attributed to the analyzed intervention. 
+
+\section{Matched Difference-in-Differences}
+
+In the econometrics literature, a method that has become widely used by scholars to address potential bias stemming from deviations of the parallel trends assumption is to use weighted least squares to estimate Equation 1, where the weights assign more relevance to observations both in the treatment and control group that are more "similar" according to their probability of receiving the treatment. These weights are called \textit{Inverse Probability Weights} as they stem from a propensity score model with the following structure. Let $g$ denote the Logit link function. Hence, the following logistic regression model predicts the probability of being assigned to the treatment group, conditional on a set of pre-determined characteristics $Z$. 
+
+\begin{equation}
+    T_i = g(\beta_0 + \theta Z_{i} + u_{i})
+    \label{model_logit}
+\end{equation}
+
+Denote $p_i$ as the predicted value from fitting the previous regression model. Hence, the inverse probability weights are defined as $w_i = \frac{1}{p_i}$ if $T_i = 1$ and $w_i = \frac{1}{1- p_i}$ if $T_i = 0$. In summary, the process to estimating a matched difference-in-difference model is: 
+
+\begin{enumerate}
+    \item Estimate \autoref{model_logit} 
+    \item Compute the IPWs $w_i$ using the predicted values from \autoref{model_logit}
+    \item Use the IPWs and estimate \autoref{model_did} using weighted least squares. 
+\end{enumerate}
+    
+\section{Empirical Challenges and My Proposed Solution}
+
+One of the main challenges when implementing matched difference-in-differences is to get a model that reflects accurately the data-generating process for treatment assignment. If the model is specified wrongly, then the weights might heighten the prevailing bias on the estimate for the ATE. To address this concern, I propose a forward step wise regression algorithm that will explore a set of potential models for the treatment assignment rule and choose the one with highest accuracy (lowest prediction error) to estimate the IPWs and use them to alleviate potential bias on the difference-in-difference model.
+
+In a nutshell, the forward stepwise regression algorithm does the following: 
+
+\begin{enumerate}
+
+\item For a given vector of variables $z$, define a vector $b(z)$ that includes all the variables in $z$ as well as their squared terms, inverse hyperbolic sin transformation, and all the possible interactions between the variables. 
+
+\item For each element $x \in b(z)$, run the logistic regression model of $T_i$ on $x$ and the chosen predictors (for the first lap of the loop, this is an empty vector). Compute the root mean squared prediction error (RMSPE). Denote $RMSPE(x)$ as the prediction error of the logistic regression model when $x$ is the vector of independent variables used in the model. Hence, I'll have a vector $R$ that contains all the $RMSPE(x)$ of each variable $x$. 
+
+\item Choose the $x$ such that $RMSPE(x) = \underset{x}{\mathrm{argmin}} R$, store that $x$ in a list of chosen predictors, and remove it from the vector $b(z)$. 
+
+\item Repeat step 2 and 3 until we ran out of independent variables or until there is no improvement in the accuracy of the model. 
+
+    
+\end{enumerate}
+
+Once I chose the model that better predicts treatment assignment in the observed population, I compute IPWs with such model and use them to estimate the Average Treatment Effect. I compute standard errors and p-values using randomization inference (i.e. estimating a placebo distribution of the Average Treatment Effect using random draws from a uniform distribution as treatment variables). 
+
+\section{Implementation}
+
+To implement this algorithm I rely on 5 main functions that will take as input a data frame with all the variables required to estimate the Propensity Score Model, or the Difference-in-Difference model, accordingly. Also, I wrote two auxiliary functions in order to perform statistical inference for the Average Treatment Effect. The first auxiliary function creates a random treatment assignment rule according to a uniform distribution. Then, I use this randomly assigned treatment $T_i$ to estimate an empirical distribution of the ATE, under random assignment. With this distribution, I can compute standard errors, rank-based p-values. The second function takes this empirical distribution and creates a graph that shows its kernel density and compares it with the estimated Average Treatment Effect. This provides a visual representation of the null hypothesis for statistical significance. 
+
+The following diagram depicts the top-down design of my implementation. 
+
+```{r, echo = FALSE, include = TRUE, out.height = "200px", out.width = "150px", fig.align = 'center'}
+knitr::include_graphics("C:/Users/luise/OneDrive - Indiana University/Statistical Computing/Final_Project/topdown.png")
+```
+
+\subsection{Functions Description}
+
+The following table summarizes the input-output relation between the written functions, as well as the type of each input. It will serve as guide for keeping track of the relation across the objects in the environment. 
+
+```{r, echo = FALSE, include = TRUE, out.height = "250px", out.width = "250px", fig.align = 'center'}
+knitr::include_graphics("C:/Users/luise/OneDrive - Indiana University/Statistical Computing/Final_Project/input_output.png")
+```
+
+\begin{enumerate}
+\item \textbf{did randomization}: since getting a measure of the reliability of the estimates (i.e. standard errors and p-values) is the last step when estimating a regression model, this is my top function. This function takes as inputs all the variables needed to estimate the DID model, estimates it using the IPW stemming from the model with highest prediction accuracy and performs statistical inference using randomization inference. 
+
+\item \textbf{did model}: this function takes as input all the variables required to estimate the DID model, and uses a fixed-effects estimator ("fixest" library) to compute the coefficient of the ATE by running Equation 1. 
+
+\item \textbf{psm weights}: this function estimates the logit regression model with the set of predictors that yields the highest prediction accuracy from all the explored models. With the fitted values of such model, inverse probability weights are computed and stored in a new data frame identical to the data used to estimate the model, but with an additional variable for the weights. This function also reports the accuracy metrics of the model (i.e. the Root Mean Squared Prediction Error). 
+
+\item \textbf{model selection}: this function iteratively estimates propensity score models using different combinations of the potential set of predictors. Here is where the forward stepwise regression algorithm is implemented. As output it reports a vector with the names of the chosen variables, along with a matrix showing how the prediction accuracy improved as an additional variable was included in the model. 
+
+\item \textbf{data build}: this function delimits the space from which the selection algorithm will pick the model. It takes as input a list of potential predictors and creates a data frame including such predictors, along with some transformations of them (i.e. squared values and inverse hyperbolic sine transform) and the interactions they could have with each other. 
+
+\end{enumerate}
+
+
+\subsection{Remarks on design decisions}
+
+\begin{itemize}
+
+\item \textbf{Input structure:} adhering to the notion behind top-down design, I make that all my functions call upon each other from top to down. To avoid R's lazy evaluation, I specified that all the functions need to specify all the required variables to estimate the regression models. If a variable is not included, the function shows an error message. This input structure, however, obeys to the nature of the regression model estimated at each step. For example, the last three functions are related with the estimation of the IPWs through the logistic regression. Hence, I need to at least specify the outcome variable, the set of predictors (independent variables for the regression), and the unit variable. This last one is relevant as it serves as the link between the dataset used for the propensity score model and the one used for the difference-in-differences model. 
+
+Moreover, I included lines of code to show error messages in case inputs were not defined, and warning messages in case the weights were not specified for the estimation of the DID model. Yet, I only included these lines of code on the \textit{data build} and \textit{did model} functions. The reason for this is the nested structure I imposed on the functions. Since each function calls the one next to it at the top down structure, the code will naturally evaluate first the last function. Hence, it suffices that only the last function on the chain includes these lines of code. 
+
+\item \textbf{Stepwise Selection Algorithm:} I chose to write this algorithm using a while loop to potentially save some computational time. For a given vector of predictor variables $z$ with cardinality $n$, the data build function will create a data frame with $2 + 3n + \frac{n !}{2 (n - 2)!}$ variables. The first 2, accounts for the unit and outcome variables, the $3n$ for three versions of the each variable in $z$: as it is on the data set, and both the squared and inverse hyperbolic sine transformations, and the last term accounts for all the possible combinations of the untransformed variables. Since this expression involves a factorial term, as the number of variable increases, the number of potential models increases more than exponentially. Hence, testing all the potential models seems to be a daunting lengthy and potentially unnecessary task. What I did, instead, was to set the algorithm to explore individually all the potential predictors and keep adding them to the vector of chosen variables if they improve the prediction accuracy of the model. The loop stops when the prediction error stops to decrease. Intuitively, if my algorithm works properly, it should retrieve the model with highest prediction accuracy. 
+
+\item \textbf{Potential Predictors:} for this version of the project I chose to test only the squared and inverse hyperbolic sine transformation of the variables, as well as the linear interactions between each other. The motivation for this is to approximate a second order polynomial of the variables, where I am allowing for the variables to show either a convex (i.e. quadratic) or concave (i.e. inverse hyperbolic sine) relation with the outcome. I chose the inverse hyperbolic sine to avoid the problems that logs have with zeros. 
+
+\end{itemize}
+
+
+\subsection{Simulation Parameters}
+
+To test whether my algorithm is effective addressing the underlying bias of the ATE estimate, I use data from Annual Census of Local Government Finances, the U.S. Census, and Bureau of Labor Statistics to build a dataset that contains yearly observations from a sample of 1,100 U.S. counties, following from the period 2010-2020. 
+
+My experimental setting consists in analyzing a fake intervention that affects the revenue from the property income tax perceived by county governments. To simulate the potential complexity surrounding the unobserved treatment assignment rule I use an arbitrarily complex function $h$ of a vector of economic variables $x$ to determine treatment assignment. If $h(X_i) > h^*$, then the unit is treated, where $h^*$ is random scalar drawn from a normal distribution with mean 0.4 and standard deviation 0.15. I chose these parameters to induce some random unbalancedeness in the panel. In practice, this is part of the complexities faced when estimating difference-in-difference models. 
+
+```{r,eval=FALSE,echo=TRUE,include=TRUE,tidy=FALSE}
+### Non Random Treatment Assignment -- Complex Non-Linear Data Generating Process
+treat_formula = unemployment_rate*female + sqrt(age4564) + sqrt(taxes_pc/exp_pc) + currexp^2 + 
+                log(1 + college) + log(popestimate) + rnorm(nfips, mean = 0, sd = 1),
+treat_aux = percent_rank(treat_formula),
+### If above the cutoff, the county is treated
+treat_det = case_when(treat_aux <= cutoff_treatment_assignment ~ 0,
+                      treat_aux > cutoff_treatment_assignment ~ 1),)
+```
+
+
+To test whether the model is retrieving the right parameter, I create a fake outcome using data from property tax revenue and applying the treatment effect to the units that were assigned to the treatment arm under assignment rule $h$. Recalling that $did = treat \times post$ I define this fake outcome using the linear structure of the difference-in-difference model. This is equivalent to assume the difference-in-difference model is correctly specified (i.e. is not vulnerable to endogeneity in the error term/ omitted variable bias). I made this simplifying assumption since my main interest lies in the specification of the inverse probability weights, hence I run the simulation assuming I have the right data generating process for the outcome of interest. 
+
+```{r,eval=FALSE,echo=TRUE,include=TRUE,tidy=FALSE}
+fake_outcome = logproptax + ate_beta*(did) + treat_det + post + fips_fe + year_fe + epsilon)
+```
+
+For the simulation I use 2015 as the treatment period in order to have a symmetric comparison window of 5 periods before and after the intervention. For simplicity, I assume a fixed value of 7 for the Average Treatment Effect. I perform statistical inference using a placebo distribution of a 1000 samples. Given the parameters described above, this is the composition of the treatment and control group in the simulation leads to a distribution of 70\% - 30\%, between the treatment and control arm of the study, respectively. 
+
+\subsection{Simulation Results}
+
+
+The following table shows the results from estimating the DID model without any weights. As we can see, in this example the complexity of the data generating process is inducing some bias on the ATE estimate. 
+
+```{r,eval=TRUE,echo=FALSE,include=TRUE,tidy=TRUE}
+etable(unweighted_model_baseline)
+```
+
+The following graph shows the RMSPE as the number of predictors included in the propensity score model increases. The panel shows four graphs, each for a different number of predictor variables in vector $z$. The first one shows the case when there are only two potential predictor variables. Hence, the algortihm explores only 3 candidate  (i.e. $||b(z)|| = 3$), where the fully saturated one yields the lowest prediction error. The second panel on the top shows the case when there are 4 predictor variables in vector $z$. Hence, $||b(z)|| = 20$. However, as we can see the algorithm stops when it reaches 16 predictors, and does not evaluates the last four as it reached a point where accuracy was not improved by adding variables. Similar stories are observed for the two graphs at the bottom. 
+
+```{r,eval=TRUE,echo=FALSE,include=TRUE,tidy=TRUE}
+all_conv_plots <- grid.arrange(convergence_plot2,convergence_plot4,convergence_plot6,convergence_plot8)
+```
+Table 1 shows the coefficient estimates for the ATE as the number of variables in the predictor vector $z$ increases. In this baseline simulation it is clear the algorithm is effective improving the prediction accuracy of the ATE. Recall the theoretical value used for this simulation is 7. Table 2 compares the result from the model with highest prediction accuracy from Table 1 against the results from the unweighted regression model. 
+
+
+```{r,eval=TRUE,echo=FALSE,include=TRUE,tidy=TRUE}
+### Results from the Simulation
+knitr::kable(results_baseline, booktabs = T, format= "latex", align = "ccc", 
+             caption = "Average Treatment Effect Estimates", digits = 4)
+
+knitr::kable(final_comp, booktabs = T, format= "latex", align = "ccc", 
+             caption = "Unweighted vs Weighted Model", digits = 4)
+```
+
+To show how the randomization inference algorithm works I show a graph with the empirical placebo distribution for the ATE coming from the model with highest treatment prediction accuracy. As expected, the placebo distribution is centered around zero and observing a large enough ATE coming from the DID model suggests the treatment effect is statistically significant. Observing the weird lumps near the mean of the distribution, however, is something that I was not expecting from the simulation. 
+
+```{r,eval=TRUE,echo=FALSE,include=TRUE,tidy=TRUE}
+ate_graph <- ate_inference_graph(emp_dist)
+```
+
+\section{Tests}
+
+I developed a set of simple tests to verify the functions are working as they should. As mentioned above, I included some lines of code to display an error message in case some of the inputs is not defined. I formally test whether the functions show these error messages using the \textit{testthat} library. This is a list of all the tests I implemented for my functions: 
+
+\begin{enumerate}
+
+\item Verify the warning and error messages are displayed correctly. Error messages appear when there is a missing argument in the function. Warning messages appear when such missing argument has a default option. In case of the weights, is a vector of equal weight and for the number of samples my default option is 100. 
+
+\item Verify the estimation of the ATE is the same regardless forgets to specify the weights (i.e. missing argument) or the weights are set to NULL. 
+
+\item Verify the data build function is computing correctly the right number of potential variables. To test that, I compare the dimensions of the output data frame from such function and the result from calculating manually the number of potential variables. As mentioned above, this latter one is given by the following equation. Following the notation above, I am calculating the cardinality of vector $b(z)$, which I will denote with $n$. 
+
+\begin{equation}
+n = 2 + 3n + \frac{n !}{2 (n - 2)!}
+\end{equation}
+
+The R script named $`Script Tests.R`$ contains all the details on the implementation of these tests.
+
+\end{enumerate}
+
+Finally, I did an informal simulation test to assess to which extent the algorithm improves the estimation of the ATE for different potential values this parameter could take. Hence, I took a random draw of 1000 samples from a uniform distribution ranging from 1 to 10. Without losing generality, to make the code run faster I simplified the testing environment to just include a vector of 4 potential covariates. Then, I implemented the algorithm assuming the true ATE was a sample of such distribution and computed two types of prediction errors: 
+
+\begin{itemize}
+\item Prediction Error 1: compares the coefficient estimates from the unweighted and IPW weighted regression
+\item Prediction Error 2: compares the coefficient estimate from the weighted regression with the true theoretical value of the ATE. 
+\end{itemize}
+
+Intuitively, the first prediction error should show the overall improvement the algorithm has on reducing the bias from estimating the DID model without IP weights. The second prediction error describes the average bias of the algorithm. If this technique is indeed improving the estimation accuracy of the model, then the expected value of the second prediction error should be approximately zero. The following graph shows the results from the simulation exercise. 
+
+
+```{r,eval=TRUE,echo=FALSE,include=TRUE,tidy=TRUE}
+knitr::kable(pred_errors_results, booktabs = T, format= "latex", align = "ccc", 
+             caption = "Prediction Error", digits = 4)
+
+
+pred_error_plots <- grid.arrange(rmspe1_dist,rmspe2_dist)
+```
+
+
+\section{Concluding Remarks}
+
+For this project I implemented a forward stepwise regression algorithm to improve the accuracy on the estimation of the ATE through a matched difference-in-difference model. The key problem this algorithm tries to solve is approximating the data generating process of the treatment assignment rule, which is unknown in most observational studies. This is particularly useful when such assignment rule has complex functional forms that might induce some bias on the traditional coefficient estimate. 
+In this sense, this is a data-driven algorithm to choose the model with highest prediction accuracy for the treatment assignment rule and use that to compute inverse probability weights that, if used to estimate the ATE, should reduce the underlying bias induced by the complex nature of the data generating process sorting units into treatment. 
+
+I test this algorithm using public finance data and in my simple toy example I show the potential benefits of nailing down the true data generating process of the treatment assignment rule. However, the current version of this algorithm is not bulletproof as it not always derives in a reduction of the bias. Therefore, there is room for improvement on the current implementation. 
+
+\section{Github}
+
+You can find all the code in my github repository here. https://github.com/LuisNavarro07/stat610_finalproject.git
+
+
+
